@@ -82,4 +82,8 @@ OpenId
 * AES 模式为 ECB，填充为 PKCS7
 * 响应密文需要做段位交换：`body[:7] + body[20:] + body[7:20]`
 
-如果 Home Assistant 里添加集成时报连接失败，优先检查 `OpenId` 是否取自登录后的请求，以及户号是否是 `GetUsersV20` 返回的 `customerCode`。
+如果 Home Assistant 里添加集成时报「OpenId 无效」，优先检查 `OpenId` 是否取自登录后的请求（登录前的请求里它可能是空的）。
+
+## 关于 Utoken 过期
+
+集成会自动处理：业务接口返回 401 或空响应时，会重新调用 `AutomaticLoginV20` 换新 Utoken 再重试一次。如果重试仍失败，实体会显示为不可用（而不是空值），错误详情在 HA 日志里搜索 `shenzhen_water`。

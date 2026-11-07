@@ -57,6 +57,20 @@ Integration
 
 添加时会请求一次小程序账单接口校验信息是否可用。
 
+### OpenId 失效了怎么办
+
+进入「设置 → 设备与服务 → 深圳水务 → 配置」，直接改 OpenId 再保存即可，不需要删掉集成重加。保存时会立即校验，校验通过后自动重载。
+
+### 设置项
+
+在同一个「配置」页面还能改**刷新间隔**，默认 360 分钟（6 小时），可填 30 ~ 1440。水务账单更新很慢，不建议调得太频繁。
+
+其余参数（API 域名、小程序 appid / 版本、TenantId、Channel、User-Agent、AES 密钥常量、请求超时）对所有人都一样，已经内置在 [`const.py`](custom_components/shenzhen_water/const.py) 里，不需要任何配置文件。
+
+### 敏感信息保存在哪
+
+OpenId、户号**只保存在你自己 Home Assistant 的 `config/.storage/core.config_entries` 里**，由你在网页表单中填写。仓库里不含任何个人数据。
+
 ## 抓包提示
 
 用 Charles 打开微信小程序“环水管家”，进入账单或户号页面，关注 `szgk.sz-water.com.cn` 下的请求。通常可在登录后的账单请求头里找到：

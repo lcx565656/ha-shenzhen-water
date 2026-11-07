@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime
 import json
+import logging
 import re
 import secrets
 import string
@@ -13,10 +14,18 @@ import async_timeout
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
-from .const import DEFAULT_CHANNEL, DEFAULT_TENANT_ID
+from . import const
+from .const import (
+    DEFAULT_CHANNEL,
+    DEFAULT_TENANT_ID,
+    REQUEST_KEY_PREFIX,
+    REQUEST_KEY_SUFFIX,
+    TIMEOUT,
+    USER_AGENT,
+    mini_program_referer,
+)
 
-REQUEST_KEY_PREFIX = "CD3AA097"
-REQUEST_KEY_SUFFIX = "CE92AD77"
+_LOGGER = logging.getLogger(__name__)
 
 
 class ShenzhenWaterApiError(Exception):
@@ -24,13 +33,19 @@ class ShenzhenWaterApiError(Exception):
 
 
 class ShenzhenWaterAuthError(ShenzhenWaterApiError):
-    """Shenzhen Water auth error."""
+    """Utoken 失效，重新登录后可以恢复。"""
+
+
+class ShenzhenWaterOpenIdError(ShenzhenWaterApiError):
+    """OpenId 本身不被服务端识别，重登也没用，只能换 OpenId。"""
+
+
+# 服务端认不出 OpenId 时的提示
+_OPENID_INVALID_MARKERS = ("不能识别用户", "不存在的用户", "9991002")
 
 
 class ShenzhenWaterApi:
     """Client for Shenzhen Water mini-program API."""
-
-    BASE_URL = "https://szgk.sz-water.com.cn"
 
     def __init__(
         self,
@@ -40,20 +55,32 @@ class ShenzhenWaterApi:
         openid: str,
         tenant_id: str = DEFAULT_TENANT_ID,
         channel: str = DEFAULT_CHANNEL,
+        base_url: str | None = None,
     ) -> None:
         self._session = session
         self._customer_code = customer_code
-        self._openid = openid
+        self._openid = (openid or "").strip()
         self._guid = ""
         self._utoken = ""
         self._tenant_id = tenant_id
         self._channel = channel
+        self._base_url = (base_url or const.BASE_URL).rstrip("/")
         self._logged_in = False
 
     @property
     def customer_code(self) -> str:
         """Return water customer code."""
         return self._customer_code
+
+    @property
+    def openid(self) -> str:
+        """Return the OpenId from the mini program."""
+        return self._openid
+
+    @property
+    def base_url(self) -> str:
+        """Return API base URL."""
+        return self._base_url
 
     @staticmethod
     def _random_header_value(length: int = 32) -> str:
@@ -118,13 +145,9 @@ class ShenzhenWaterApi:
             "Channel": self._channel,
             "Content-Type": "application/json",
             "OpenId": self._openid,
-            "Referer": "https://servicewechat.com/wx987545bf02573f61/198/page-frame.html",
+            "Referer": mini_program_referer(),
             "TenantId": self._tenant_id,
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 MiniProgramEnv/Mac "
-                "MicroMessenger/7.0.20"
-            ),
+            "User-Agent": USER_AGENT,
             "Utoken": self._utoken if include_token else "",
             "xweb_xhr": "1",
         }
@@ -146,20 +169,20 @@ class ShenzhenWaterApi:
             )
         )
 
-    async def _request(
+    async def _post(
         self,
         path: str,
         payload: dict[str, Any],
         *,
-        include_token: bool = True,
+        include_token: bool,
     ) -> dict[str, Any]:
-        """Send encrypted request to Shenzhen Water mini-program API."""
-        url = f"{self.BASE_URL}{path}"
+        """Send one encrypted request and return the decrypted body."""
+        url = f"{self._base_url}{path}"
         header_value = self._random_header_value()
         encrypted_payload = self._encrypt(payload, header_value)
 
         try:
-            async with async_timeout.timeout(20):
+            async with async_timeout.timeout(TIMEOUT):
                 async with self._session.post(
                     url,
                     headers=self._build_headers(
@@ -168,25 +191,50 @@ class ShenzhenWaterApi:
                     data=json.dumps(encrypted_payload),
                 ) as resp:
                     text = await resp.text()
-
-                    if resp.status != 200:
-                        message = f"HTTP {resp.status}: {text[:300]}"
-                        if self._looks_like_auth_error(message):
-                            raise ShenzhenWaterAuthError(message)
-                        raise ShenzhenWaterApiError(message)
-
+                    status = resp.status
                     response_header = resp.headers.get("04A52C9F")
-                    if not response_header:
-                        raise ShenzhenWaterApiError(
-                            f"Response header 04A52C9F not found: {text[:300]}"
-                        )
-
-                    data = self._decrypt(text, response_header)
 
         except ShenzhenWaterApiError:
             raise
         except Exception as err:
             raise ShenzhenWaterApiError(f"Request failed: {err}") from err
+
+        # 401 一定是身份问题（OpenId / Utoken / TenantId），直接当成认证错误，
+        # 这样上层可以重新登录而不是把它当成普通故障。
+        if status == 401:
+            raise ShenzhenWaterAuthError(
+                f"{path} 认证失败（HTTP 401）: {text[:200]}"
+            )
+
+        if status != 200:
+            message = f"HTTP {status}: {text[:300]}"
+            if self._looks_like_auth_error(message):
+                raise ShenzhenWaterAuthError(message)
+            raise ShenzhenWaterApiError(message)
+
+        if not text:
+            # 空响应体：服务端接受了请求但没给数据（常见于 token 已过期、
+            # 渠道/租户被拒）。归到认证错误，让上层重登一次再判断。
+            raise ShenzhenWaterAuthError(
+                f"{path} 返回空响应（可能是 Utoken 已失效）"
+            )
+
+        if not response_header:
+            raise ShenzhenWaterApiError(
+                f"Response header 04A52C9F not found: {text[:300]}"
+            )
+
+        return self._decrypt(text, response_header)
+
+    async def _request(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        include_token: bool = True,
+    ) -> dict[str, Any]:
+        """Send encrypted request to Shenzhen Water mini-program API."""
+        data = await self._post(path, payload, include_token=include_token)
 
         if data.get("code") not in (0, "0"):
             message = json.dumps(data, ensure_ascii=False)
@@ -198,21 +246,34 @@ class ShenzhenWaterApi:
 
     async def async_login(self) -> dict[str, Any]:
         """Refresh mini-program token and GUID from OpenId."""
-        data = await self._request(
-            "/api/wechat/op/user/AutomaticLoginV20",
-            {
-                "openid": self._openid,
-                "channel": self._channel,
-            },
-            include_token=False,
-        )
+        # 登录接口本身失败时不能再抛 AuthError：那会让上层反复重试登录。
+        # OpenId 被服务端拒绝 → OpenIdError（换 OpenId 才有用）；
+        # 其它失败（网络、WAF）→ 普通 API 错误。
+        try:
+            data = await self._request(
+                "/api/wechat/op/user/AutomaticLoginV20",
+                {
+                    "openid": self._openid,
+                    "channel": self._channel,
+                },
+                include_token=False,
+            )
+        except ShenzhenWaterAuthError as err:
+            raise ShenzhenWaterApiError(f"自动登录失败: {err}") from err
+        except ShenzhenWaterApiError as err:
+            if any(marker in str(err) for marker in _OPENID_INVALID_MARKERS):
+                raise ShenzhenWaterOpenIdError(
+                    f"OpenId 不被服务端识别，请重新抓取: {err}"
+                ) from err
+            raise
+
         login_data = data.get("data") or {}
         token = login_data.get("token")
         guid = login_data.get("guid")
 
         if not token or not guid:
-            raise ShenzhenWaterAuthError(
-                f"Automatic login did not return token and guid: {data}"
+            raise ShenzhenWaterApiError(
+                f"自动登录未返回 token/guid: {data}"
             )
 
         self._utoken = str(token)
@@ -223,6 +284,33 @@ class ShenzhenWaterApi:
     async def _ensure_login(self) -> None:
         if not self._logged_in:
             await self.async_login()
+
+    async def async_call(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        include_token: bool = True,
+    ) -> dict[str, Any]:
+        """Call a business endpoint, re-logging in once when the token expired.
+
+        深圳水务的 Utoken 会过期（也可能被服务端主动踢掉），原来只在
+        ``async_get_all`` 里重登一次，其它调用路径全都直接失败。
+        统一放在这里，任何接口都能自愈。
+        """
+        await self._ensure_login()
+
+        try:
+            return await self._request(
+                path, payload, include_token=include_token
+            )
+        except ShenzhenWaterAuthError as err:
+            _LOGGER.debug("%s 认证失败，重新登录后重试: %s", path, err)
+
+        self._logged_in = False
+        await self.async_login()
+
+        return await self._request(path, payload, include_token=include_token)
 
     def _base_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -238,8 +326,7 @@ class ShenzhenWaterApi:
 
     async def async_get_users(self) -> dict[str, Any]:
         """Get bound water users."""
-        await self._ensure_login()
-        return await self._request(
+        return await self.async_call(
             "/api/wechat/op/user/GetUsersV20",
             {
                 **self._base_payload(),
@@ -249,8 +336,7 @@ class ShenzhenWaterApi:
 
     async def async_get_latest_bill_details(self) -> dict[str, Any]:
         """Get latest bill details."""
-        await self._ensure_login()
-        return await self._request(
+        return await self.async_call(
             "/api/wechat/op/BillInfo/GetLatestBillDetails2V30",
             {
                 **self._base_payload(),
@@ -262,7 +348,6 @@ class ShenzhenWaterApi:
 
     async def async_get_bill_info(self, bill_month: int | None = None) -> dict[str, Any]:
         """Get bill info from the mini-program bill endpoint."""
-        await self._ensure_login()
         payload = {
             **self._base_payload(),
             "customerCodes": [self._customer_code],
@@ -270,19 +355,18 @@ class ShenzhenWaterApi:
         if bill_month:
             payload["costdate"] = int(bill_month)
 
-        return await self._request(
+        return await self.async_call(
             "/api/wechat/op/user/billInfo/BillingInfoBycustomerCodesV30",
             payload,
         )
 
     async def async_get_all(self) -> dict[str, Any]:
-        """Get all Shenzhen Water data."""
-        try:
-            current = await self.async_get_latest_bill_details()
-        except ShenzhenWaterAuthError:
-            self._logged_in = False
-            await self.async_login()
-            current = await self.async_get_latest_bill_details()
+        """Get all Shenzhen Water data.
+
+        认证错误会由 ``async_call`` 自动重登重试；这里再失败就是真失败，
+        直接往上抛，让 HA 实体进入 unavailable 而不是显示空值。
+        """
+        current = await self.async_get_latest_bill_details()
 
         current_rows = current.get("data") or []
         current_month = current_rows[0].get("costDate") if current_rows else None
@@ -290,27 +374,18 @@ class ShenzhenWaterApi:
         current_bill_info = {}
         try:
             current_bill_info = await self.async_get_bill_info(current_month)
-        except ShenzhenWaterAuthError:
-            raise
         except ShenzhenWaterApiError:
             current_bill_info = {}
 
-        previous = {}
         bill_info_rows = current_bill_info.get("data") or []
-        previous_month = None
         if bill_info_rows:
             current_month = bill_info_rows[0].get("costDate") or current_month
-        if current_month:
-            month = datetime.strptime(str(current_month), "%Y%m")
-            year = month.year - 1 if month.month == 1 else month.year
-            previous = 12 if month.month == 1 else month.month - 1
-            previous_month = year * 100 + previous
 
+        previous: dict[str, Any] = {}
+        previous_month = _previous_month(current_month)
         if previous_month:
             try:
                 previous = await self.async_get_bill_info(previous_month)
-            except ShenzhenWaterAuthError:
-                raise
             except ShenzhenWaterApiError:
                 previous = {}
 
@@ -319,3 +394,20 @@ class ShenzhenWaterApi:
             "current_bill_info": current_bill_info,
             "previous": previous,
         }
+
+
+def _previous_month(current_month: Any) -> int | None:
+    """Return the previous billing month as YYYYMM."""
+    if not current_month:
+        return None
+
+    try:
+        month = datetime.strptime(str(current_month), "%Y%m")
+    except ValueError:
+        _LOGGER.debug("无法解析账单月份: %s", current_month)
+        return None
+
+    year = month.year - 1 if month.month == 1 else month.year
+    previous = 12 if month.month == 1 else month.month - 1
+
+    return year * 100 + previous

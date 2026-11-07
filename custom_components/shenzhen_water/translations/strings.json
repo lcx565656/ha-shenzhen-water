@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "添加深圳水务",
-        "description": "请输入从“环水管家”微信小程序抓取到的 OpenId。集成会自动登录并读取已绑定户号。",
+        "description": "请输入从「环水管家」微信小程序抓取到的 OpenId。集成会自动登录并读取已绑定户号。OpenId 只保存在你自己 Home Assistant 的配置项里。",
         "data": {
           "openid": "OpenId"
         }
@@ -18,11 +18,31 @@
       }
     },
     "error": {
-      "cannot_connect": "连接失败，请检查 OpenId",
-      "no_accounts": "这个 OpenId 没有读取到已绑定户号"
+      "cannot_connect": "连接失败：无法访问深圳水务接口，请检查 HA 能否访问 szgk.sz-water.com.cn（详细原因见 HA 日志）",
+      "invalid_openid": "OpenId 无效或已失效：服务端无法识别该用户。请重新从「环水管家」小程序抓取登录后的 OpenId",
+      "no_accounts": "这个 OpenId 没有读取到已绑定户号",
+      "invalid_update_interval": "刷新间隔请填 30 ~ 1440 分钟之间的整数"
     },
     "abort": {
-      "already_configured": "该户号已经添加过"
+      "already_configured": "该户号已经添加过",
+      "no_account_found": "没有选择到有效户号，请重新添加"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "深圳水务设置",
+        "description": "OpenId 失效时在这里重新填写即可，不需要删除集成。",
+        "data": {
+          "openid": "OpenId",
+          "update_interval_minutes": "刷新间隔（分钟）"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "连接失败：无法访问深圳水务接口（详细原因见 HA 日志）",
+      "invalid_openid": "OpenId 无效或已失效，请重新抓取",
+      "invalid_update_interval": "刷新间隔请填 30 ~ 1440 分钟之间的整数"
     }
   }
 }

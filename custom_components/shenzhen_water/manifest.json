@@ -1,7 +1,7 @@
 {
   "domain": "shenzhen_water",
   "name": "深圳水务",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "documentation": "https://github.com/Chaxcy/ha-shenzhen-water",
   "issue_tracker": "https://github.com/Chaxcy/ha-shenzhen-water/issues",
   "codeowners": ["@Chaxcy"],
